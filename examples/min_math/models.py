@@ -12,6 +12,5 @@ class MathAction(Action):
 
 class MathObservation(Observation):
     """Observation with reward based on final character match."""
-    # We only use the Observation.reward attr, so no non-trivial code is needed.
 
-    pass
+    # We only use the Observation.reward attr, so no non-trivial code is needed.
