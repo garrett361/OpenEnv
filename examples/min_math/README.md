@@ -18,6 +18,19 @@ response. Not actually specific to math yet.
 
 ## Quick Start
 
+Run the standalone test script `python examples/min_math/test_min_math.py`:
+
+```python
+❯ python examples/min_math/test_min_math.py
+=== Min Math Environment Test ===
+
+Starting server...
+Gold: '2'  Response: '3'  Reward: 0.0
+Gold: '2'  Response: '2'  Reward: 1.0
+
+All tests passed!
+```
+
 The simplest way to use the Min Math environment is through the `MathClient` class:
 
 ```python
