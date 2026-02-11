@@ -1,8 +1,7 @@
-"""Stage 1 tests: Workspace, ToolModule protocol, SWEEnvironment skeleton."""
+"""Tests for SWEEnvironment, SWEState, and ToolModule protocol."""
 
 from pathlib import Path
 
-import pytest
 from fastmcp import FastMCP
 
 from swe_env.models import SWEState
@@ -14,8 +13,6 @@ from openenv.core.env_server.types import Action
 
 
 class DummyToolModule:
-    """Minimal implementation satisfying the ToolModule protocol."""
-
     def __init__(self):
         self.registered = False
         self.reset_called = False
@@ -29,50 +26,6 @@ class DummyToolModule:
 
     def cleanup(self) -> None:
         self.cleanup_called = True
-
-
-class TestWorkspace:
-    def test_path_exists_after_init(self):
-        ws = Workspace()
-        assert ws.path.exists()
-        assert ws.is_active
-        ws.close()
-
-    def test_reset_clears_contents(self):
-        ws = Workspace()
-        (ws.path / "file.txt").write_text("hello")
-        (ws.path / "subdir").mkdir()
-        (ws.path / "subdir" / "nested.txt").write_text("nested")
-
-        ws.reset()
-
-        assert ws.path.exists()
-        assert list(ws.path.iterdir()) == []
-        ws.close()
-
-    def test_reset_returns_path(self):
-        ws = Workspace()
-        result = ws.reset()
-        assert result == ws.path
-        ws.close()
-
-    def test_close_removes_directory(self):
-        ws = Workspace()
-        path = ws.path
-        ws.close()
-        assert not path.exists()
-
-    def test_two_workspaces_have_different_paths(self):
-        ws1 = Workspace()
-        ws2 = Workspace()
-        assert ws1.path != ws2.path
-        ws1.close()
-        ws2.close()
-
-    def test_is_active_false_after_close(self):
-        ws = Workspace()
-        ws.close()
-        assert not ws.is_active
 
 
 class TestToolModuleProtocol:
@@ -104,7 +57,7 @@ class TestSWEState:
         assert s.episode_id == "ep-1"
 
 
-class TestSWEEnvironmentSkeleton:
+class TestSWEEnvironment:
     def test_reset_returns_observation(self):
         env = SWEEnvironment.with_default_tools()
         obs = env.reset()
@@ -153,7 +106,8 @@ class TestSWEEnvironmentSkeleton:
         assert not Path(ws_path).exists()
 
     def test_list_tools_empty_without_modules(self):
-        env = SWEEnvironment.with_default_tools()
+        ws = Workspace()
+        env = SWEEnvironment(workspace=ws, tool_modules=[])
         env.reset()
         obs = env.step(ListToolsAction())
 

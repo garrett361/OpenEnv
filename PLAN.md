@@ -32,7 +32,7 @@ This plan is the primary guide for implementing `swe_env`. It is designed for **
 | Stage | Status | Description |
 |-------|--------|-------------|
 | Stage 1 | Done | Foundation: Workspace, ToolModule protocol, SWEEnvironment skeleton |
-| Stage 2 | Not Started | Bash tool module |
+| Stage 2 | Done | Bash tool module |
 | Stage 3 | Not Started | Git tool module |
 | Stage 4 | Not Started | Python tool module |
 | Stage 5 | Not Started | App, Client, Dockerfile, integration tests |
@@ -105,7 +105,8 @@ To add a tool module to the environment, instantiate it and append to the `tool_
 | `envs/swe_env/__init__.py` | Exports `SWEState` |
 | `envs/swe_env/server/app.py` | Stub (wired up in Stage 5) |
 | `envs/swe_env/client.py` | Stub (wired up in Stage 5) |
-| `tests/envs/test_swe_env_stage1.py` | 21 tests covering Workspace, ToolModule protocol, SWEState, SWEEnvironment skeleton |
+| `tests/envs/swe_env/test_workspace.py` | 6 tests covering Workspace class |
+| `tests/envs/swe_env/test_environment.py` | 15 tests covering ToolModule protocol, SWEState, SWEEnvironment skeleton |
 
 ### Key Implementation Details
 
@@ -121,57 +122,55 @@ To add a tool module to the environment, instantiate it and append to the `tool_
 - `reset()` calls `self._workspace.reset()`, then `module.reset()` for each module, builds `SWEState`
 - `step()` increments `self._state.step_count`, delegates to `super().step()`
 - `close()` calls `module.cleanup()` for each module, `self._workspace.close()`, `super().close()`
-- `with_default_tools()` classmethod: creates `Workspace()`, builds `get_workspace = lambda: workspace.path`, instantiates tool modules (currently empty list), returns `cls(workspace=workspace, tool_modules=tool_modules)`
+- `with_default_tools()` classmethod: creates `Workspace()`, builds `get_workspace = lambda: workspace.path`, instantiates tool modules (currently `[BashToolModule]`), returns `cls(workspace=workspace, tool_modules=tool_modules)`
 
-**How to add a new tool module (Stages 2-4):**
+**How to add a new tool module (Stages 3-4):**
 1. Create `envs/swe_env/server/tools/<name>_tool.py` implementing `ToolModule`
 2. In `SWEEnvironment.with_default_tools()`, import and append to `tool_modules` list
-3. Write tests in `tests/envs/test_swe_env_stage<N>.py`
+3. Write tests in `tests/envs/swe_env/test_<name>_tool.py`
 
 ### Verification
 
 ```bash
-PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage1.py -v
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_workspace.py tests/envs/swe_env/test_environment.py -v
 # 21 passed
 ```
 
 ---
 
-## Stage 2: Bash Tool
+## Stage 2: Bash Tool (DONE)
 
-**File to create:** `envs/swe_env/server/tools/bash_tool.py`
+### What Was Built
 
-**Study first:**
-- `envs/swe_env/server/tool_module.py` -- the ToolModule protocol to implement
-- `envs/swe_env/server/environment.py` -- how `with_default_tools()` wires modules in
-- `software-agent-sdk/openhands-tools/openhands/tools/terminal/definition.py` -- OpenHands terminal tool for inspiration (but we use simpler subprocess.run)
+| File | Purpose |
+|------|---------|
+| `envs/swe_env/server/tools/bash_tool.py` | `BashToolModule` -- runs commands via `subprocess.run(["bash", "-c", command], cwd=workspace)` |
+| `tests/envs/swe_env/test_bash_tool.py` | 11 tests covering protocol conformance, direct tool behavior, and integration |
 
-### `BashToolModule`
+### Key Implementation Details
 
-Constructor takes `get_workspace: Callable[[], Path]` and `default_timeout: int = 120`.
+**BashToolModule** (`server/tools/bash_tool.py`):
+- Constructor takes `get_workspace: Callable[[], Path]` and `default_timeout: int = 120`
+- Registers one MCP tool: `bash(command: str, timeout: int = 0) -> dict`
+- `timeout=0` means use `default_timeout`; any positive value overrides it
+- Returns `{"stdout": str, "stderr": str, "exit_code": int}`
+- Catches `subprocess.TimeoutExpired` and returns `exit_code=124`
+- `reset()` and `cleanup()` are no-ops (stateless, fresh process per call)
 
-Registers one MCP tool:
-- **`bash(command: str, timeout: int) -> dict`** -- runs `subprocess.run(["bash", "-c", command], cwd=workspace)`, returns `{stdout, stderr, exit_code}`. Handles `TimeoutExpired` (exit_code=124).
+**Wiring** (`server/environment.py`):
+- `with_default_tools()` now imports and instantiates `BashToolModule(get_workspace=get_workspace)` in the `tool_modules` list
 
-`reset()` and `cleanup()` are no-ops (no internal state).
+**Test patterns established** (`tests/envs/swe_env/test_bash_tool.py`):
+- Unit tests use a fixture that constructs `SWEEnvironment` with only `BashToolModule` (not `with_default_tools()`)
+- Helper `_bash(env, command, timeout=0)` calls `CallToolAction` and extracts the result dict. The `obs.result` from `CallToolAction` is a `CallToolResult` object with a `.data` attribute (already a dict), not a raw JSON string -- the helper handles both cases via `hasattr(result, "data")`
+- Integration tests use `SWEEnvironment.with_default_tools()` for full-stack verification
 
-After creating the module, update `SWEEnvironment.with_default_tools()` to include it.
+### Verification
 
-### Tests (`tests/envs/test_swe_env_stage2.py`)
-- Basic command: `echo hello` returns stdout="hello\n", exit_code=0
-- Failed command: `false` returns exit_code=1
-- Timeout: long-running command returns exit_code=124
-- Stderr: invalid command captures stderr
-- Working directory: `pwd` returns workspace path
-- File creation: `touch foo.txt` creates file in workspace
-- Full integration: `SWEEnvironment` with just `BashToolModule`, list_tools returns `["bash"]`, CallToolAction works
-
-### Definition of Done
-- [ ] `BashToolModule` exists and satisfies `ToolModule` protocol
-- [ ] `SWEEnvironment.with_default_tools()` includes `BashToolModule`
-- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage2.py -v` passes
-- [ ] Stage 1 tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage1.py -v`
-- [ ] Update Progress Tracker: Stage 2 -> "Done"
+```bash
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_bash_tool.py -v
+# 11 passed
+```
 
 ---
 
@@ -180,7 +179,9 @@ After creating the module, update `SWEEnvironment.with_default_tools()` to inclu
 **File to create:** `envs/swe_env/server/tools/git_tool.py`
 
 **Study first:**
-- Stage 1 code (must be complete)
+- `envs/swe_env/server/tools/bash_tool.py` -- follow the same ToolModule pattern (constructor, register, reset, cleanup)
+- `tests/envs/swe_env/test_bash_tool.py` -- follow the same test patterns (fixture, `_bash()` helper, `obs.result.data` extraction)
+- `envs/swe_env/server/environment.py` -- see how `with_default_tools()` wires modules in
 - `envs/git_env/server/git_task_environment.py` -- existing git env for patterns (but we use local subprocess, not Gitea)
 
 ### `GitToolModule`
@@ -191,7 +192,7 @@ Registers two MCP tools:
 
 After creating the module, update `SWEEnvironment.with_default_tools()` to include it.
 
-### Tests (`tests/envs/test_swe_env_stage3.py`)
+### Tests (`tests/envs/swe_env/test_git_tool.py`)
 - `git init` + `git status` in workspace
 - `git add` + `git commit` flow
 - `working_dir` parameter navigates into subdirectory
@@ -199,11 +200,13 @@ After creating the module, update `SWEEnvironment.with_default_tools()` to inclu
 - `git_clone` with branch/depth parameters
 - Full integration: list_tools returns `["bash", "git", "git_clone"]`
 
+Follow the same test patterns as `test_bash_tool.py`: fixture builds `SWEEnvironment` with only the module(s) under test, helper function extracts `obs.result.data`, integration tests use `with_default_tools()`.
+
 ### Definition of Done
 - [ ] `GitToolModule` exists and satisfies `ToolModule` protocol
 - [ ] `SWEEnvironment.with_default_tools()` includes `GitToolModule`
-- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage3.py -v` passes
-- [ ] Previous stage tests still pass
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_git_tool.py -v` passes
+- [ ] Previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
 - [ ] Update Progress Tracker: Stage 3 -> "Done"
 
 ---
@@ -213,7 +216,9 @@ After creating the module, update `SWEEnvironment.with_default_tools()` to inclu
 **File to create:** `envs/swe_env/server/tools/python_tool.py`
 
 **Study first:**
-- Stage 1 code (must be complete)
+- `envs/swe_env/server/tools/bash_tool.py` -- follow the same ToolModule pattern
+- `tests/envs/swe_env/test_bash_tool.py` -- follow the same test patterns
+- `envs/swe_env/server/environment.py` -- see how `with_default_tools()` wires modules in
 - `src/openenv/core/tools/local_python_executor.py` -- PyExecutor wrapper (constructor, `run()` method, `CodeExecResult` return type)
 - `envs/coding_env/server/python_codeact_env.py` -- how coding_env uses PyExecutor (reset creates fresh instance)
 - `src/openenv/core/env_server/types.py` -- `CodeExecResult` dataclass (has `.stdout`, `.stderr`, `.exit_code`)
@@ -230,18 +235,20 @@ Registers one MCP tool:
 
 After creating the module, update `SWEEnvironment.with_default_tools()` to include it.
 
-### Tests (`tests/envs/test_swe_env_stage4.py`)
+### Tests (`tests/envs/swe_env/test_python_tool.py`)
 - Basic execution: `print("hello")` returns stdout
 - Persistent namespace: define `x = 5` then `print(x)` in separate calls
 - Error handling: syntax errors return stderr + exit_code=1
 - Reset clears state: after reset, previously defined variables are gone
 - Full integration: all three tools listed, Python variables persist across steps within episode
 
+Follow the same test patterns as `test_bash_tool.py`.
+
 ### Definition of Done
 - [ ] `PythonToolModule` exists and satisfies `ToolModule` protocol
 - [ ] `SWEEnvironment.with_default_tools()` includes `PythonToolModule`
-- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage4.py -v` passes
-- [ ] Previous stage tests still pass
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_python_tool.py -v` passes
+- [ ] Previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
 - [ ] Update Progress Tracker: Stage 4 -> "Done"
 
 ### Note on dependency
@@ -274,7 +281,7 @@ Follows echo_env pattern. Adds `git` and `bash` to runtime image via `apt-get in
 ### `pyproject.toml`
 Dependencies: `openenv-core[core]`, `fastapi`, `pydantic`, `uvicorn`, `requests`, `smolagents`.
 
-### End-to-end tests (`tests/envs/test_swe_env_integration.py`)
+### End-to-end tests (`tests/envs/swe_env/test_integration.py`)
 - Full workflow: reset -> list_tools -> bash (create file) -> git init -> git add -> git commit -> python (read file) -> verify cross-tool state sharing
 - Workspace isolation: files from one episode gone after reset
 - Multiple episodes: sequential reset/work/reset cycles
@@ -283,9 +290,9 @@ Dependencies: `openenv-core[core]`, `fastapi`, `pydantic`, `uvicorn`, `requests`
 
 ### Definition of Done
 - [ ] `server/app.py`, `client.py`, `__init__.py`, `openenv.yaml`, `pyproject.toml`, `server/Dockerfile` all exist
-- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_integration.py -v` passes
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_integration.py -v` passes
 - [ ] `uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/` passes
-- [ ] All previous stage tests still pass
+- [ ] All previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
 - [ ] Update Progress Tracker: Stage 5 -> "Done"
 
 ---
@@ -318,7 +325,7 @@ Integration tests will verify isolation by running two `SWEEnvironment` instance
 - Both define Python variables -- verify no namespace leakage.
 - One resets while the other is mid-episode -- verify no cross-contamination.
 
-## File Structure (current state after Stage 1)
+## File Structure (current state after Stage 2)
 
 ```
 envs/swe_env/
@@ -337,24 +344,26 @@ envs/swe_env/
     ├── tool_module.py           # ToolModule Protocol
     ├── tools/
     │   ├── __init__.py
-    │   ├── bash_tool.py         # Stage 2 (not yet created)
+    │   ├── bash_tool.py         # BashToolModule (done)
     │   ├── git_tool.py          # Stage 3 (not yet created)
     │   └── python_tool.py       # Stage 4 (not yet created)
     ├── Dockerfile               # scaffolded
     └── requirements.txt         # scaffolded
 
-tests/envs/
-└── test_swe_env_stage1.py       # 21 tests, all passing
+tests/envs/swe_env/             # no __init__.py needed
+├── test_workspace.py            # 6 tests -- Workspace class
+├── test_environment.py          # 15 tests -- SWEState, ToolModule protocol, SWEEnvironment
+└── test_bash_tool.py            # 11 tests -- BashToolModule
 ```
 
 ## Verification Commands
 
 ```bash
-# Run tests for a specific stage
-PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage1.py -v
-
 # Run all swe_env tests
-PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env*.py -v
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v
+
+# Run a single test file
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_bash_tool.py -v
 
 # Lint
 uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/
@@ -412,3 +421,4 @@ These tools can be added later following the same `ToolModule` pattern:
 |------|---------|---------------|-------|
 | 2026-02-11 | 1 | Initial plan created | Explored OpenEnv + OpenHands SDK, designed architecture |
 | 2026-02-11 | 2 | Stage 1 complete (21 tests passing) | Workspace simplified from create/destroy cycle to eager `TemporaryDirectory` with `reset()` clearing contents. Cleaned up scaffolded dead code (`app.py`, `client.py` stubbed; deleted `swe_env_environment.py`). Established code style rules (no dead code, no comment headers). |
+| 2026-02-11 | 3 | Stage 2 complete (32 tests passing) | Implemented `BashToolModule` and wired into `with_default_tools()`. Reorganized tests from `tests/envs/test_swe_env_stage*.py` into `tests/envs/swe_env/` with semantic grouping: `test_workspace.py` (6), `test_environment.py` (15), `test_bash_tool.py` (11). No `__init__.py` in test dir. Key discovery: `obs.result` from `CallToolAction` is a `CallToolResult` object with `.data` dict, not raw JSON -- test helpers use `hasattr(result, "data")` to handle this. Updated Stage 1's `test_list_tools_empty_without_modules` to construct env manually (since `with_default_tools()` now includes BashToolModule). |
