@@ -23,12 +23,15 @@ This plan is the primary guide for implementing `swe_env`. It is designed for **
 - **All new code goes under `envs/swe_env/`** and tests under `tests/envs/`.
 - **Each stage should pass its tests before moving to the next.**
 - **If you deviate from the plan**, note what changed and why in the Session Log.
+- **No dead code.** At the end of every stage, all code must be working and importable. Never leave broken scaffolding, stale imports, or references to deleted files. If something isn't needed yet, remove or stub it cleanly (a one-line docstring-only module is fine).
+- **No commented-out code or section headers.** Do not add commented-out section headers, divider lines (e.g. `# ---------------------------------------------------------------------------`), or commented-out future code. This applies to both production code AND test files. Use class names and test method names to organize — they are self-documenting.
+- **Run tests with:** `PYTHONPATH=src:envs uv run python -m pytest <test_file> -v`
 
 ## Progress Tracker
 
 | Stage | Status | Description |
 |-------|--------|-------------|
-| Stage 1 | Not Started | Foundation: Workspace, ToolModule protocol, SWEEnvironment skeleton |
+| Stage 1 | Done | Foundation: Workspace, ToolModule protocol, SWEEnvironment skeleton |
 | Stage 2 | Not Started | Bash tool module |
 | Stage 3 | Not Started | Git tool module |
 | Stage 4 | Not Started | Python tool module |
@@ -42,177 +45,105 @@ OpenEnv has individual environments for Python execution (`coding_env`), Git ope
 
 This plan creates `swe_env`, a new OpenEnv environment that provides a sandboxed, persistent workspace with modular tools exposed via MCP. Initial scope: **bash, git, Python**. The tool module design supports adding more tools (file_editor, grep, glob, test runner) later without changing the core architecture.
 
+## Architecture Overview
+
+### How MCP Tool Calling Works
+
+Agents never see MCP protocol details. There are two interaction modes:
+
+1. **Tool-calling mode (most common):** The agent sends `CallToolAction(tool_name="bash", arguments={"command": "ls"})` and gets back a `CallToolObservation`. This is identical in shape to LLM tool-calling schema. `MCPEnvironment.step()` routes it through FastMCP transparently.
+
+2. **CodeAct mode:** `MCPEnvironment.get_callables()` extracts registered tools as plain Python callables. An agent writes `result = bash(command="ls")` directly.
+
+MCP is an implementation detail giving us automatic tool discovery, standard dispatch, and modularity.
+
+### Workspace Lifecycle
+
+The `HTTPEnvServer` creates one `SWEEnvironment` instance per WebSocket session (via the factory pattern). Within that session:
+
+```
+WebSocket connect → factory creates SWEEnvironment (Workspace dir created eagerly)
+  → client sends "reset" → Workspace.reset() clears dir contents (episode 1)
+  → client sends "step" × N (workspace persists across steps)
+  → client sends "reset" → Workspace.reset() clears dir contents (episode 2)
+  → ...
+  → WebSocket disconnect → env.close() → Workspace.close() removes dir
+```
+
+The Workspace uses `tempfile.TemporaryDirectory` so cleanup happens even if `close()` is missed (via `__del__`). Each concurrent session gets its own independent Workspace.
+
+### ToolModule Pattern
+
+Each tool category is a `ToolModule` that:
+1. Receives a `get_workspace: Callable[[], Path]` in its constructor
+2. Registers MCP tools with a shared `FastMCP` server via `register(mcp)`
+3. Supports `reset()` (episode boundary) and `cleanup()` (session end)
+
+To add a tool module to the environment, instantiate it and append to the `tool_modules` list in `SWEEnvironment.with_default_tools()`.
+
 ## Key Design Decisions
 
 1. **Base class: `MCPEnvironment`** -- gives us `ListToolsAction`/`CallToolAction` routing, `get_callables()` for CodeAct mode, and tool name validation for free.
-2. **`ToolModule` protocol** -- each tool category (bash, git, python) is an independent module that registers its tools with a shared `FastMCP` server. Adding a new tool = one new file + one line in the constructor.
-3. **`get_workspace` callable pattern** -- tool modules receive a `() -> Path` callable instead of a static `Path`, so they always reference the *current* workspace even after `reset()` recreates it.
-4. **Bash via `subprocess.run`** (stateless per-command) -- simpler than a persistent shell session. Each command runs in the workspace directory. Upgrade path to persistent shell exists but isn't needed initially.
-5. **Git via local subprocess** (not Gitea) -- self-contained, no external service dependency. Agent runs `git` commands directly in the workspace.
-6. **Python via existing `PyExecutor`** -- reuses `src/openenv/core/tools/local_python_executor.py` (wraps `smolagents.LocalPythonExecutor`) for persistent namespace execution.
+2. **`ToolModule` protocol** -- each tool category (bash, git, python) is an independent module that registers its tools with a shared `FastMCP` server. Adding a new tool = one new file + one line in the factory.
+3. **`get_workspace` callable pattern** -- tool modules receive a `() -> Path` callable instead of a static `Path`, so they always reference the current workspace.
+4. **Bash via `subprocess.run`** (stateless per-command) -- simpler than a persistent shell session. Each command runs in the workspace directory.
+5. **Git via local subprocess** (not Gitea) -- self-contained, no external service dependency.
+6. **Python via existing `PyExecutor`** -- reuses `src/openenv/core/tools/local_python_executor.py` for persistent namespace execution.
 
-## Sandboxing & Concurrency
+## Stage 1: Foundation (DONE)
 
-Concurrent `swe_env` instances must not interfere with each other. Isolation is provided at three layers, each progressively stronger:
+### What Was Built
 
-### Layer 1: Instance-Level Isolation (Within a Single Server Process)
+| File | Purpose |
+|------|---------|
+| `envs/swe_env/server/workspace.py` | `Workspace` class -- temp dir via `TemporaryDirectory`, `reset()` clears contents, `close()` deletes dir |
+| `envs/swe_env/server/tool_module.py` | `ToolModule` -- `runtime_checkable` Protocol with `register(mcp)`, `reset()`, `cleanup()` |
+| `envs/swe_env/models.py` | `SWEState(State)` -- adds `workspace_path: str` and `available_tools: list[str]` |
+| `envs/swe_env/server/environment.py` | `SWEEnvironment(MCPEnvironment)` -- constructor takes `workspace` + `tool_modules`, `with_default_tools()` factory |
+| `envs/swe_env/server/tools/__init__.py` | Empty package for tool modules |
+| `envs/swe_env/server/__init__.py` | Exports `SWEEnvironment` |
+| `envs/swe_env/__init__.py` | Exports `SWEState` |
+| `envs/swe_env/server/app.py` | Stub (wired up in Stage 5) |
+| `envs/swe_env/client.py` | Stub (wired up in Stage 5) |
+| `tests/envs/test_swe_env_stage1.py` | 21 tests covering Workspace, ToolModule protocol, SWEState, SWEEnvironment skeleton |
 
-OpenEnv's `HTTPEnvServer` (`src/openenv/core/env_server/http_server.py`) uses a **factory pattern**: `create_app()` receives a callable (class or factory function), and each WebSocket session calls that factory to create a **new, independent `SWEEnvironment` instance**. This means:
+### Key Implementation Details
 
-- Each session gets its own `Workspace` object, which creates a **unique temp directory** via `tempfile.mkdtemp()` (e.g., `/tmp/swe_workspace_a1b2c3/` vs `/tmp/swe_workspace_d4e5f6/`).
-- Each session gets its own `PyExecutor` instance with a **separate Python namespace**.
-- Each session gets its own `FastMCP` server with its own tool closures bound to its own workspace path.
-- Tool calls within a session are serialized by a **per-session `ThreadPoolExecutor(max_workers=1)`**, preventing race conditions within a single agent's workspace.
-- `SWEEnvironment` sets `SUPPORTS_CONCURRENT_SESSIONS = True` to opt into multi-session support. The server's `max_concurrent_envs` parameter caps how many sessions can run simultaneously.
+**Workspace** (`server/workspace.py`):
+- Creates temp dir eagerly in `__init__` via `tempfile.TemporaryDirectory(prefix="swe_workspace_")`
+- `reset()` clears contents (iterates children, removes each) but keeps the directory
+- `close()` calls `self._tmpdir.cleanup()` to remove the directory
+- `path` property returns `self._path` (a `Path` object); `is_active` checks `.exists()`
 
-**What this isolates**: Workspace directories, Python namespaces, tool state, and in-flight tool execution.
+**SWEEnvironment** (`server/environment.py`):
+- Constructor takes `workspace: Workspace` and `tool_modules: list[ToolModule]`
+- Creates `FastMCP("swe_env")`, calls `module.register(mcp)` for each module, passes `mcp` to `super().__init__(mcp)`
+- `reset()` calls `self._workspace.reset()`, then `module.reset()` for each module, builds `SWEState`
+- `step()` increments `self._state.step_count`, delegates to `super().step()`
+- `close()` calls `module.cleanup()` for each module, `self._workspace.close()`, `super().close()`
+- `with_default_tools()` classmethod: creates `Workspace()`, builds `get_workspace = lambda: workspace.path`, instantiates tool modules (currently empty list), returns `cls(workspace=workspace, tool_modules=tool_modules)`
 
-**What this does NOT isolate**: Host filesystem outside the workspace, system processes, network, environment variables, git global config (`~/.gitconfig`). A bash command like `cat /etc/passwd` or `rm -rf /home` would escape the workspace boundary.
+**How to add a new tool module (Stages 2-4):**
+1. Create `envs/swe_env/server/tools/<name>_tool.py` implementing `ToolModule`
+2. In `SWEEnvironment.with_default_tools()`, import and append to `tool_modules` list
+3. Write tests in `tests/envs/test_swe_env_stage<N>.py`
 
-### Layer 2: Docker Container Isolation (Production)
+### Verification
 
-In production, each `swe_env` server runs in its own **Docker container** (see `server/Dockerfile`). The container provides:
-
-- **Filesystem isolation**: Each container has its own root filesystem. Workspaces are truly private.
-- **Process isolation**: Processes in one container cannot see or signal processes in another.
-- **Network isolation**: Containers get separate network namespaces (unless explicitly bridged).
-- **Resource limits**: CPU, memory, and disk can be capped per container via Docker/orchestrator settings.
-
-The deployment model is **one container per environment server**, with `max_concurrent_envs` controlling how many agent sessions share a single container. For full isolation between agents, set `max_concurrent_envs=1` (one agent per container).
-
+```bash
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage1.py -v
+# 21 passed
 ```
-Training Orchestrator
-  ├── Container A (swe_env server) ← Agent 1's WebSocket session
-  │     └── /tmp/swe_workspace_xxx/
-  ├── Container B (swe_env server) ← Agent 2's WebSocket session
-  │     └── /tmp/swe_workspace_yyy/
-  └── Container C (swe_env server) ← Agent 3's WebSocket session
-        └── /tmp/swe_workspace_zzz/
-```
-
-### Layer 3: What We Build (swe_env Responsibilities)
-
-Our code is responsible for Layer 1 only. Specifically:
-
-1. **`Workspace.create()`** always produces a unique temp directory. No two instances share a workspace path.
-2. **All tool modules use `cwd=workspace_path`** when spawning subprocesses. Bash, git, and Python tools never operate on a shared or hardcoded directory.
-3. **`reset()` destroys and recreates the workspace**, ensuring no state leaks between episodes.
-4. **`close()` cleans up the workspace**, preventing temp directory accumulation.
-5. **The factory pattern** (`SWEEnvironment.with_default_tools`) creates fresh Workspace + tool module instances on every call, so the `HTTPEnvServer` can safely instantiate one per session.
-
-Docker container orchestration (Layer 2) is handled by OpenEnv's existing container runtime (`src/openenv/core/containers/`) and is outside our scope -- we just provide the Dockerfile.
-
-### Concurrency Test Plan (Stage 5)
-
-Integration tests will verify isolation by running two `SWEEnvironment` instances in parallel:
-- Both create files via bash -- verify each only sees its own files.
-- Both init git repos -- verify independent git histories.
-- Both define Python variables -- verify no namespace leakage.
-- One resets while the other is mid-episode -- verify no cross-contamination.
-
-## File Structure
-
-```
-envs/swe_env/
-├── __init__.py
-├── models.py                    # SWEState
-├── client.py                    # MCPToolClient subclass
-├── openenv.yaml
-├── pyproject.toml
-└── server/
-    ├── __init__.py
-    ├── app.py                   # create_app() entrypoint
-    ├── environment.py           # SWEEnvironment
-    ├── workspace.py             # Workspace lifecycle
-    ├── tool_module.py           # ToolModule protocol
-    ├── tools/
-    │   ├── __init__.py
-    │   ├── bash_tool.py         # BashToolModule
-    │   ├── git_tool.py          # GitToolModule
-    │   └── python_tool.py       # PythonToolModule
-    └── Dockerfile
-```
-
-## Dependency Graph
-
-```
-Stage 1 (Foundation)
-  ├── workspace.py
-  ├── tool_module.py (Protocol)
-  ├── models.py
-  └── environment.py (skeleton)
-        │
-        ├── Stage 2 (Bash) ──── independent
-        ├── Stage 3 (Git) ───── independent
-        └── Stage 4 (Python) ── independent
-              │
-              Stage 5 (Integration) ── depends on all above
-```
-
-Stages 2, 3, 4 are independent of each other (all depend only on Stage 1).
-
----
-
-## Stage 1: Foundation (Workspace + ToolModule Protocol + Environment Skeleton)
-
-**Files to create:** `server/workspace.py`, `server/tool_module.py`, `models.py`, `server/environment.py`, `server/__init__.py`, `server/tools/__init__.py`
-
-**Study first** (read these before writing code):
-- `envs/echo_env/server/echo_environment.py` -- how MCPEnvironment is subclassed, tool registration, reset/step pattern
-- `src/openenv/core/env_server/mcp_environment.py` -- MCPEnvironment constructor signature, `_step_impl` abstract method
-- `src/openenv/core/env_server/types.py` -- `State`, `Action`, `Observation` base classes
-- `envs/echo_env/models.py` -- how State is extended (if it exists; echo_env may use base State directly)
-
-### `server/workspace.py` -- Workspace
-
-Manages a temp directory per episode. Key methods:
-- `create() -> Path` -- creates fresh tmpdir, destroys old one
-- `destroy()` -- removes tmpdir
-- `path -> Path` property (raises if not initialized)
-- `is_active -> bool`
-
-### `server/tool_module.py` -- ToolModule Protocol
-
-```python
-@runtime_checkable
-class ToolModule(Protocol):
-    def register(self, mcp: FastMCP) -> None: ...
-    def reset(self) -> None: ...
-    def cleanup(self) -> None: ...
-```
-
-### `models.py` -- SWEState
-
-Extends `State` with `workspace_path: str` and `available_tools: list[str]`.
-
-### `server/environment.py` -- SWEEnvironment
-
-- Subclasses `MCPEnvironment`
-- Constructor takes `tool_modules: list[ToolModule]`, creates `FastMCP("swe_env")`, registers all modules
-- `reset()`: creates fresh workspace via `Workspace.create()`, calls `module.reset()` on each module
-- `step()`: increments step count, delegates to `super().step()` (MCPEnvironment handles tool routing)
-- `close()`: calls `module.cleanup()` on each, destroys workspace
-- `with_default_tools()` classmethod factory: creates Workspace + standard tool modules with `get_workspace = lambda: self._workspace.path`
-
-### Tests (`tests/envs/test_swe_env_stage1.py`)
-- `Workspace`: create/destroy lifecycle, create-twice replaces old, path raises before create
-- `ToolModule` protocol: mock class satisfies `isinstance` check
-- `SWEEnvironment` skeleton: reset returns observation with workspace path, state tracks step count, close destroys workspace
-
-### Definition of Done
-- [ ] All files listed above exist under `envs/swe_env/`
-- [ ] `PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env_stage1.py -v` passes
-- [ ] `SWEEnvironment` can be instantiated with no tool modules and reset/step/close work
-- [ ] Update Progress Tracker: Stage 1 -> "Done"
 
 ---
 
 ## Stage 2: Bash Tool
 
-**File to create:** `server/tools/bash_tool.py`
+**File to create:** `envs/swe_env/server/tools/bash_tool.py`
 
 **Study first:**
-- Stage 1 code (must be complete)
+- `envs/swe_env/server/tool_module.py` -- the ToolModule protocol to implement
+- `envs/swe_env/server/environment.py` -- how `with_default_tools()` wires modules in
 - `software-agent-sdk/openhands-tools/openhands/tools/terminal/definition.py` -- OpenHands terminal tool for inspiration (but we use simpler subprocess.run)
 
 ### `BashToolModule`
@@ -223,6 +154,8 @@ Registers one MCP tool:
 - **`bash(command: str, timeout: int) -> dict`** -- runs `subprocess.run(["bash", "-c", command], cwd=workspace)`, returns `{stdout, stderr, exit_code}`. Handles `TimeoutExpired` (exit_code=124).
 
 `reset()` and `cleanup()` are no-ops (no internal state).
+
+After creating the module, update `SWEEnvironment.with_default_tools()` to include it.
 
 ### Tests (`tests/envs/test_swe_env_stage2.py`)
 - Basic command: `echo hello` returns stdout="hello\n", exit_code=0
@@ -235,14 +168,16 @@ Registers one MCP tool:
 
 ### Definition of Done
 - [ ] `BashToolModule` exists and satisfies `ToolModule` protocol
-- [ ] `PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env_stage2.py -v` passes
+- [ ] `SWEEnvironment.with_default_tools()` includes `BashToolModule`
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage2.py -v` passes
+- [ ] Stage 1 tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage1.py -v`
 - [ ] Update Progress Tracker: Stage 2 -> "Done"
 
 ---
 
 ## Stage 3: Git Tool
 
-**File to create:** `server/tools/git_tool.py`
+**File to create:** `envs/swe_env/server/tools/git_tool.py`
 
 **Study first:**
 - Stage 1 code (must be complete)
@@ -254,6 +189,8 @@ Registers two MCP tools:
 - **`git(command: str, working_dir: str = "", timeout: int = 60) -> dict`** -- runs `git <command>` in workspace (or `workspace/working_dir`). Returns `{stdout, stderr, exit_code}`.
 - **`git_clone(repo_url: str, target_dir: str = "", branch: str = "", depth: int = 0) -> dict`** -- structured clone with parameters. Longer default timeout (300s).
 
+After creating the module, update `SWEEnvironment.with_default_tools()` to include it.
+
 ### Tests (`tests/envs/test_swe_env_stage3.py`)
 - `git init` + `git status` in workspace
 - `git add` + `git commit` flow
@@ -264,14 +201,16 @@ Registers two MCP tools:
 
 ### Definition of Done
 - [ ] `GitToolModule` exists and satisfies `ToolModule` protocol
-- [ ] `PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env_stage3.py -v` passes
+- [ ] `SWEEnvironment.with_default_tools()` includes `GitToolModule`
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage3.py -v` passes
+- [ ] Previous stage tests still pass
 - [ ] Update Progress Tracker: Stage 3 -> "Done"
 
 ---
 
 ## Stage 4: Python Tool
 
-**File to create:** `server/tools/python_tool.py`
+**File to create:** `envs/swe_env/server/tools/python_tool.py`
 
 **Study first:**
 - Stage 1 code (must be complete)
@@ -289,6 +228,8 @@ Registers one MCP tool:
 `reset()`: sets `self._executor = None` (next call creates fresh executor).
 `cleanup()`: sets `self._executor = None`.
 
+After creating the module, update `SWEEnvironment.with_default_tools()` to include it.
+
 ### Tests (`tests/envs/test_swe_env_stage4.py`)
 - Basic execution: `print("hello")` returns stdout
 - Persistent namespace: define `x = 5` then `print(x)` in separate calls
@@ -298,7 +239,9 @@ Registers one MCP tool:
 
 ### Definition of Done
 - [ ] `PythonToolModule` exists and satisfies `ToolModule` protocol
-- [ ] `PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env_stage4.py -v` passes
+- [ ] `SWEEnvironment.with_default_tools()` includes `PythonToolModule`
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage4.py -v` passes
+- [ ] Previous stage tests still pass
 - [ ] Update Progress Tracker: Stage 4 -> "Done"
 
 ### Note on dependency
@@ -335,32 +278,89 @@ Dependencies: `openenv-core[core]`, `fastapi`, `pydantic`, `uvicorn`, `requests`
 - Full workflow: reset -> list_tools -> bash (create file) -> git init -> git add -> git commit -> python (read file) -> verify cross-tool state sharing
 - Workspace isolation: files from one episode gone after reset
 - Multiple episodes: sequential reset/work/reset cycles
-- Concurrent instances: two environments in parallel, verify no cross-contamination (see Sandboxing section)
+- Concurrent instances: two environments in parallel, verify no cross-contamination
 - CodeAct mode: `env.get_callables()` returns bash/git/python functions
 
 ### Definition of Done
 - [ ] `server/app.py`, `client.py`, `__init__.py`, `openenv.yaml`, `pyproject.toml`, `server/Dockerfile` all exist
-- [ ] `PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env_integration.py -v` passes
+- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_integration.py -v` passes
 - [ ] `uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/` passes
 - [ ] All previous stage tests still pass
 - [ ] Update Progress Tracker: Stage 5 -> "Done"
 
 ---
 
+## Sandboxing & Concurrency
+
+Concurrent `swe_env` instances must not interfere with each other. Isolation is provided at three layers, each progressively stronger:
+
+### Layer 1: Instance-Level Isolation (Within a Single Server Process)
+
+OpenEnv's `HTTPEnvServer` (`src/openenv/core/env_server/http_server.py`) uses a **factory pattern**: `create_app()` receives a callable (class or factory function), and each WebSocket session calls that factory to create a **new, independent `SWEEnvironment` instance**. This means:
+
+- Each session gets its own `Workspace` object, which creates a **unique temp directory** via `tempfile.TemporaryDirectory`.
+- Each session gets its own `PyExecutor` instance with a **separate Python namespace**.
+- Each session gets its own `FastMCP` server with its own tool closures bound to its own workspace path.
+- Tool calls within a session are serialized by a **per-session `ThreadPoolExecutor(max_workers=1)`**, preventing race conditions within a single agent's workspace.
+- `SWEEnvironment` sets `SUPPORTS_CONCURRENT_SESSIONS = True` to opt into multi-session support.
+
+### Layer 2: Docker Container Isolation (Production)
+
+In production, each `swe_env` server runs in its own **Docker container**. The deployment model is **one container per environment server**, with `max_concurrent_envs` controlling how many agent sessions share a single container.
+
+Docker container orchestration is handled by OpenEnv's existing container runtime and is outside our scope -- we just provide the Dockerfile.
+
+### Concurrency Test Plan (Stage 5)
+
+Integration tests will verify isolation by running two `SWEEnvironment` instances in parallel:
+- Both create files via bash -- verify each only sees its own files.
+- Both init git repos -- verify independent git histories.
+- Both define Python variables -- verify no namespace leakage.
+- One resets while the other is mid-episode -- verify no cross-contamination.
+
+## File Structure (current state after Stage 1)
+
+```
+envs/swe_env/
+├── __init__.py                  # exports SWEState
+├── models.py                    # SWEState(State)
+├── client.py                    # stub (Stage 5)
+├── openenv.yaml                 # scaffolded
+├── pyproject.toml               # scaffolded
+├── .dockerignore                # scaffolded
+├── README.md                    # scaffolded
+└── server/
+    ├── __init__.py              # exports SWEEnvironment
+    ├── app.py                   # stub (Stage 5)
+    ├── environment.py           # SWEEnvironment(MCPEnvironment)
+    ├── workspace.py             # Workspace (TemporaryDirectory wrapper)
+    ├── tool_module.py           # ToolModule Protocol
+    ├── tools/
+    │   ├── __init__.py
+    │   ├── bash_tool.py         # Stage 2 (not yet created)
+    │   ├── git_tool.py          # Stage 3 (not yet created)
+    │   └── python_tool.py       # Stage 4 (not yet created)
+    ├── Dockerfile               # scaffolded
+    └── requirements.txt         # scaffolded
+
+tests/envs/
+└── test_swe_env_stage1.py       # 21 tests, all passing
+```
+
 ## Verification Commands
 
 ```bash
 # Run tests for a specific stage
-PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env_stage1.py -v
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env_stage1.py -v
 
 # Run all swe_env tests
-PYTHONPATH=src:envs uv run pytest tests/envs/test_swe_env*.py -v
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/test_swe_env*.py -v
 
 # Lint
 uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/
 
 # Full test suite (ensure no regressions)
-PYTHONPATH=src:envs uv run pytest tests/ -v --tb=short
+PYTHONPATH=src:envs uv run python -m pytest tests/ -v --tb=short
 ```
 
 ## Critical Files (Read-Only References)
@@ -374,50 +374,25 @@ PYTHONPATH=src:envs uv run pytest tests/ -v --tb=short
 | `envs/echo_env/` | Reference MCPEnvironment implementation |
 | `envs/coding_env/` | Reference for Python execution pattern |
 | `envs/git_env/` | Reference for Git operations pattern |
-| `rfcs/003-mcp-support.md` | MCP architecture RFC |
 
 ## Key Imports Quick Reference
 
-These are the imports you'll need most often. All from OpenEnv core (read-only):
-
 ```python
-# Base classes for the environment
 from openenv.core.env_server.mcp_environment import MCPEnvironment
 from openenv.core.env_server.types import Action, Observation, State
-
-# MCP action/observation types (used by agents to interact with tools)
 from openenv.core.env_server.mcp_types import (
-    CallToolAction,
-    CallToolObservation,
-    ListToolsAction,
-    ListToolsObservation,
+    CallToolAction, CallToolObservation, ListToolsAction, ListToolsObservation,
 )
-
-# HTTP server factory
 from openenv.core.env_server.http_server import create_app
-
-# MCP client (for the client.py)
 from openenv.core.mcp_client import MCPToolClient
-
-# Python executor (for Stage 4)
 from openenv.core.tools.local_python_executor import PyExecutor
-# PyExecutor.run(code: str) -> CodeExecResult  (has .stdout, .stderr, .exit_code)
-
-# FastMCP (third-party, for tool registration)
 from fastmcp import FastMCP
-# Usage: mcp = FastMCP("name"); @mcp.tool; def my_tool(...) -> ...: ...
+
+from swe_env.models import SWEState
+from swe_env.server.workspace import Workspace
+from swe_env.server.tool_module import ToolModule
+from swe_env.server.environment import SWEEnvironment
 ```
-
-### MCPEnvironment Constructor Signature
-
-```python
-MCPEnvironment.__init__(self, mcp_server: FastMCP, transform=None) -> None
-```
-
-Key methods inherited:
-- `step(action)` -- routes ListToolsAction/CallToolAction, delegates others to `_step_impl()`
-- `get_callables() -> dict[str, Callable]` -- extracts Python callables from FastMCP for CodeAct
-- `_step_impl(action, timeout_s, **kwargs) -> Observation` -- abstract, must implement
 
 ## Future Extensions (Post-MVP)
 
@@ -433,9 +408,7 @@ These tools can be added later following the same `ToolModule` pattern:
 
 ## Session Log
 
-Record what was done in each session so future sessions have context.
-
 | Date | Session | What was done | Notes |
 |------|---------|---------------|-------|
 | 2026-02-11 | 1 | Initial plan created | Explored OpenEnv + OpenHands SDK, designed architecture |
-| | | | |
+| 2026-02-11 | 2 | Stage 1 complete (21 tests passing) | Workspace simplified from create/destroy cycle to eager `TemporaryDirectory` with `reset()` clearing contents. Cleaned up scaffolded dead code (`app.py`, `client.py` stubbed; deleted `swe_env_environment.py`). Established code style rules (no dead code, no comment headers). |
