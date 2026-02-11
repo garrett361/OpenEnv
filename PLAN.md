@@ -50,7 +50,7 @@ This ensures every future session can pick up exactly where the last one left of
 | Stage 2 | Done | Bash tool module |
 | Stage 3 | Done | File editor tool module |
 | Stage 4 | Done | SWE-Bench task lifecycle (task-based reset, patch extraction, evaluation) |
-| Stage 5 | Not Started | App, Client, Dockerfile, integration tests |
+| Stage 5 | Done | App, Client, Dockerfile, integration tests |
 
 ---
 
@@ -648,12 +648,64 @@ Dependencies: `openenv-core[core]`, `fastapi`, `pydantic`, `uvicorn`, `requests`
 **Tool completeness:**
 - `list_tools` returns exactly `["bash", "file_editor"]`
 
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `envs/swe_env/server/app.py` | FastAPI app via `create_app(SWEEnvironment.with_default_tools, ...)` |
+| `envs/swe_env/client.py` | `SWEEnv(MCPToolClient)` -- client for connecting to swe_env server |
+| `envs/swe_env/__init__.py` | Updated exports: `SWEEnv`, `SWEBenchInstance`, `SWEState`, MCP types |
+| `envs/swe_env/pyproject.toml` | Updated dependencies: added fastapi, pydantic, uvicorn, requests |
+| `envs/swe_env/server/environment.py` | Fixed lambda lint error (E731) in `with_default_tools()` |
+| `tests/envs/swe_env/test_integration.py` | 13 tests: tool completeness, CodeAct mode, full workflow, isolation, concurrency |
+
+### Key Implementation Details
+
+**App** (`server/app.py`):
+- Follows echo_env pattern exactly: `create_app(SWEEnvironment.with_default_tools, CallToolAction, CallToolObservation, env_name="swe_env")`
+- Dual import support (in-repo via relative imports, standalone via absolute)
+- `main()` entry point for `uv run --project . server`
+
+**Client** (`client.py`):
+- `SWEEnv` extends `MCPToolClient` with no additional methods (all functionality inherited)
+- Supports `list_tools()`, `call_tool()`, `reset()`, `step()` via base class
+
+**Exports** (`__init__.py`):
+- `SWEEnv` (client), `SWEBenchInstance`, `SWEState`, `CallToolAction`, `ListToolsAction`
+
+**Config files** (`openenv.yaml`, `pyproject.toml`, `Dockerfile`, `.dockerignore`, `requirements.txt`):
+- All existed from scaffolding and were correct; `pyproject.toml` updated to match echo_env's explicit dependency list
+
+**Lint fix** (`environment.py`):
+- Replaced `get_workspace: Callable[[], Any] = lambda: workspace.path` with a `def` to satisfy ruff E731
+- Removed unused `Callable` import
+
+**Integration tests** (`test_integration.py`):
+- `TestToolCompleteness`: verifies `list_tools` and `get_callables()` both return `["bash", "file_editor"]`
+- `TestCodeActMode`: verifies callables are callable and execute correctly (bash echo, file_editor create)
+- `TestFullSWEBenchWorkflow`: reset with instance → bash explore → file_editor fix → get_patch → evaluate → resolved
+- `TestWorkspaceIsolation`: files from previous episode gone after reset
+- `TestMultipleEpisodes`: sequential reset/work/reset with different repo instances
+- `TestConcurrentInstances`: two environments in parallel (independent workspaces, patches, undo histories; reset one doesn't affect other)
+- `TestAppImports`: verifies `app` is FastAPI instance and `SWEEnv` is MCPToolClient subclass
+
+### Verification
+
+```bash
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_integration.py -v
+# 13 passed
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v
+# 86 passed (6 workspace + 15 environment + 11 bash + 25 file_editor + 16 task_lifecycle + 13 integration)
+uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/
+# All checks passed
+```
+
 ### Definition of Done
-- [ ] `server/app.py`, `client.py`, `__init__.py`, `openenv.yaml`, `pyproject.toml`, `server/Dockerfile` all exist
-- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_integration.py -v` passes
-- [ ] `uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/` passes
-- [ ] All previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
-- [ ] Update Progress Tracker: Stage 5 -> "Done"
+- [x] `server/app.py`, `client.py`, `__init__.py`, `openenv.yaml`, `pyproject.toml`, `server/Dockerfile` all exist
+- [x] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_integration.py -v` passes
+- [x] `uv run ruff format envs/swe_env/ --check && uv run ruff check envs/swe_env/` passes
+- [x] All previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
+- [x] Update Progress Tracker: Stage 5 -> "Done"
 
 ---
 

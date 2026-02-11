@@ -21,7 +21,9 @@ class SWEBenchInstance(BaseModel):
 class SWEState(State):
     """Environment state extended with workspace metadata."""
 
-    workspace_path: str = Field(default="", description="Path to the workspace directory")
+    workspace_path: str = Field(
+        default="", description="Path to the workspace directory"
+    )
     available_tools: List[str] = Field(
         default_factory=list, description="Names of registered MCP tools"
     )

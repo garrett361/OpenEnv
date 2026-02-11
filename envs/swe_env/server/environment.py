@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 
 from fastmcp import FastMCP
@@ -77,7 +77,9 @@ class SWEEnvironment(MCPEnvironment):
             workspace_path=str(self._workspace.path),
             available_tools=tool_names,
             instance_id=self._instance.instance_id if self._instance else "",
-            problem_statement=self._instance.problem_statement if self._instance else "",
+            problem_statement=self._instance.problem_statement
+            if self._instance
+            else "",
             repo_path=str(self._repo_path) if self._repo_path else "",
         )
 
@@ -244,7 +246,9 @@ class SWEEnvironment(MCPEnvironment):
         produces an independent instance with its own workspace and tools.
         """
         workspace = Workspace()
-        get_workspace: Callable[[], Any] = lambda: workspace.path
+
+        def get_workspace() -> Any:
+            return workspace.path
 
         from swe_env.server.tools.bash_tool import BashToolModule
         from swe_env.server.tools.file_editor_tool import FileEditorToolModule

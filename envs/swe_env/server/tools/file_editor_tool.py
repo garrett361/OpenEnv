@@ -70,9 +70,7 @@ class FileEditorToolModule:
                 f"{i + start_line:6}\t{line}" for i, line in enumerate(lines)
             )
             return (
-                f"Here's the result of running `cat -n` on {path}:\n"
-                + numbered
-                + "\n"
+                f"Here's the result of running `cat -n` on {path}:\n" + numbered + "\n"
             )
 
         def _view(path: Path, view_range: str) -> Dict[str, Any]:
@@ -134,9 +132,7 @@ class FileEditorToolModule:
                 "exit_code": 0,
             }
 
-        def _str_replace(
-            path: Path, old_str: str, new_str: str
-        ) -> Dict[str, Any]:
+        def _str_replace(path: Path, old_str: str, new_str: str) -> Dict[str, Any]:
             if old_str == new_str:
                 return {
                     "output": "No replacement was performed. "
@@ -185,9 +181,7 @@ class FileEditorToolModule:
                 "exit_code": 0,
             }
 
-        def _insert(
-            path: Path, insert_line: int, new_str: str
-        ) -> Dict[str, Any]:
+        def _insert(path: Path, insert_line: int, new_str: str) -> Dict[str, Any]:
             content = path.read_text()
             lines = content.split("\n")
             num_lines = len(lines)
