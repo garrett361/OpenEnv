@@ -1,7 +1,7 @@
 """ToolModule protocol for swe_env.
 
-Each tool category (bash, git, python) implements this protocol to register
-its MCP tools with a shared FastMCP server.
+Each tool category (bash, file_editor, etc.) implements this protocol to
+register its MCP tools with a shared FastMCP server.
 """
 
 from typing import Protocol, runtime_checkable
