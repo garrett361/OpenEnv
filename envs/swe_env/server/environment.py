@@ -120,9 +120,11 @@ class SWEEnvironment(MCPEnvironment):
         get_workspace: Callable[[], Any] = lambda: workspace.path
 
         from swe_env.server.tools.bash_tool import BashToolModule
+        from swe_env.server.tools.file_editor_tool import FileEditorToolModule
 
         tool_modules: List[ToolModule] = [
             BashToolModule(get_workspace=get_workspace),
+            FileEditorToolModule(get_workspace=get_workspace),
         ]
 
         return cls(workspace=workspace, tool_modules=tool_modules)
