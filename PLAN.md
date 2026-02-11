@@ -49,7 +49,7 @@ This ensures every future session can pick up exactly where the last one left of
 | Stage 1 | Done | Foundation: Workspace, ToolModule protocol, SWEEnvironment skeleton |
 | Stage 2 | Done | Bash tool module |
 | Stage 3 | Done | File editor tool module |
-| Stage 4 | Not Started | SWE-Bench task lifecycle (task-based reset, patch extraction, evaluation) |
+| Stage 4 | Done | SWE-Bench task lifecycle (task-based reset, patch extraction, evaluation) |
 | Stage 5 | Not Started | App, Client, Dockerfile, integration tests |
 
 ---
@@ -542,15 +542,63 @@ These tests use a **local git repo** created in a temp dir as the "remote" to av
 **Full lifecycle test:**
 - Reset with instance → agent uses bash + file_editor to fix bug → get_patch() → evaluate() → resolved=True
 
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `envs/swe_env/models.py` | Added `SWEBenchInstance` model; extended `SWEState` with `instance_id`, `problem_statement`, `repo_path` |
+| `envs/swe_env/server/environment.py` | Added task-based `reset(instance=...)`, `_setup_instance()`, `get_patch()`, `evaluate()` |
+| `envs/swe_env/__init__.py` | Updated to export `SWEBenchInstance` |
+| `tests/envs/swe_env/test_task_lifecycle.py` | 16 tests covering task reset, patch extraction, evaluation, and full lifecycle |
+
+### Key Implementation Details
+
+**SWEBenchInstance** (`models.py`):
+- Pydantic `BaseModel` with fields: `instance_id`, `repo`, `base_commit`, `problem_statement`, `test_patch=""`, `version=""`
+- `repo` accepts either `owner/name` shorthand or full URL (local path works too for testing)
+
+**Task-based reset** (`environment.py`):
+- `reset()` accepts optional `instance` parameter (dict or `SWEBenchInstance`)
+- Clears instance state (`_instance`, `_base_commit`, `_repo_path`) before each reset
+- `_setup_instance()`: parses instance, determines repo URL (prefixes `https://github.com/` for `owner/name` format, treats paths starting with `/` as local), clones into `workspace/repo`, checks out `base_commit`, applies `test_patch` via `git apply` if non-empty
+- State populated with `instance_id`, `problem_statement`, `repo_path` after setup
+- Observation metadata includes `instance_id` and `problem_statement` when instance is present
+
+**Patch extraction** (`get_patch()`):
+- Returns empty string if no repo, no base_commit, or repo doesn't exist
+- Runs `git add -A` then `git diff --cached {base_commit}` to capture all changes relative to starting point
+
+**Evaluation** (`evaluate(test_command="")`):
+- Defaults to `python -m pytest` if no command provided
+- Returns `{"exit_code": int, "stdout": str, "stderr": str, "resolved": bool}`
+- `resolved = (exit_code == 0)` -- MVP simplification, sufficient for RL training reward signal
+- Returns error dict if no repo available
+
+**Test patterns** (`test_task_lifecycle.py`):
+- `local_repo` fixture creates a local git repo with a buggy `calc.py` (`add` does subtraction) -- avoids network deps
+- `test_patch_content` fixture provides a unified diff that adds `test_calc.py` which calls `add(2, 3)` and asserts `== 5`
+- `_make_instance()` helper builds instance dicts from the local_repo fixture
+- Same `_bash()` and `_edit()` helpers as other test files
+- Full lifecycle test: reset with instance → bash explore → file_editor fix → get_patch → evaluate → resolved
+
+### Verification
+
+```bash
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_task_lifecycle.py -v
+# 16 passed
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v
+# 73 passed (6 workspace + 15 environment + 11 bash + 25 file_editor + 16 task_lifecycle)
+```
+
 ### Definition of Done
-- [ ] `SWEBenchInstance` model exists in `models.py`
-- [ ] `SWEState` extended with instance fields
-- [ ] `reset()` accepts `instance` parameter and sets up workspace
-- [ ] `get_patch()` extracts git diff
-- [ ] `evaluate()` runs tests and returns results
-- [ ] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_task_lifecycle.py -v` passes
-- [ ] Previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
-- [ ] Update Progress Tracker: Stage 4 -> "Done"
+- [x] `SWEBenchInstance` model exists in `models.py`
+- [x] `SWEState` extended with instance fields
+- [x] `reset()` accepts `instance` parameter and sets up workspace
+- [x] `get_patch()` extracts git diff
+- [x] `evaluate()` runs tests and returns results
+- [x] `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/test_task_lifecycle.py -v` passes
+- [x] Previous tests still pass: `PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v`
+- [x] Update Progress Tracker: Stage 4 -> "Done"
 
 ---
 
@@ -636,12 +684,12 @@ Integration tests will verify isolation by running two `SWEEnvironment` instance
 - Both edit files via file_editor -- verify independent undo histories.
 - One resets while the other is mid-episode -- verify no cross-contamination.
 
-## File Structure (current state after Stage 3)
+## File Structure (current state after Stage 4)
 
 ```
 envs/swe_env/
-├── __init__.py                  # exports SWEState
-├── models.py                    # SWEState(State), SWEBenchInstance (Stage 4)
+├── __init__.py                  # exports SWEState, SWEBenchInstance
+├── models.py                    # SWEState(State), SWEBenchInstance
 ├── client.py                    # stub (Stage 5)
 ├── openenv.yaml                 # scaffolded
 ├── pyproject.toml               # scaffolded
@@ -665,7 +713,7 @@ tests/envs/swe_env/             # no __init__.py needed
 ├── test_environment.py          # 15 tests -- SWEState, ToolModule protocol, SWEEnvironment
 ├── test_bash_tool.py            # 11 tests -- BashToolModule
 ├── test_file_editor_tool.py     # 25 tests -- FileEditorToolModule
-├── test_task_lifecycle.py       # Stage 4
+├── test_task_lifecycle.py       # 16 tests -- task reset, patch extraction, evaluation
 └── test_integration.py          # Stage 5
 ```
 
@@ -737,3 +785,4 @@ These can be added later following the same `ToolModule` pattern:
 | 2026-02-11 | 3 | Stage 2 complete (32 tests passing) | Implemented `BashToolModule` and wired into `with_default_tools()`. Reorganized tests from `tests/envs/test_swe_env_stage*.py` into `tests/envs/swe_env/` with semantic grouping: `test_workspace.py` (6), `test_environment.py` (15), `test_bash_tool.py` (11). No `__init__.py` in test dir. Key discovery: `obs.result` from `CallToolAction` is a `CallToolResult` object with `.data` dict, not raw JSON -- test helpers use `hasattr(result, "data")` to handle this. Updated Stage 1's `test_list_tools_empty_without_modules` to construct env manually (since `with_default_tools()` now includes BashToolModule). |
 | 2026-02-11 | 4 | Plan revised for SWE-Bench focus | Studied SkyRL's SWE-Bench implementation and OpenHands SDK tool design. Key findings: (1) Git tool unnecessary -- agents use bash for git operations (OpenHands pattern). (2) PythonToolModule (PyExecutor) wrong for SWE-Bench -- agents edit files and run tests, not in-memory Python. (3) File editor is the most critical missing tool. (4) Need task-based reset (clone repo, apply test patch), patch extraction, and evaluation. Replaced Stages 3-5: Stage 3 = File Editor Tool, Stage 4 = SWE-Bench Task Lifecycle, Stage 5 = Integration. Dropped git_tool.py and python_tool.py from file structure. |
 | 2026-02-11 | 5 | Stage 3 complete (57 tests passing) | Implemented `FileEditorToolModule` with 5 operations (view, create, str_replace, insert, undo_edit) and wired into `with_default_tools()`. Kept implementation simpler than OpenHands reference -- no response truncation (agents can use `view_range`), no encoding detection (UTF-8 only), no binary file checks, no whitespace-retry on str_replace miss. These can be added later if needed. Key design choice: undo history dict lives on `self` but closures in `register()` capture a reference to the same dict object, so `reset()` calling `.clear()` correctly empties the history that tool closures see (same pattern would apply to any future stateful tool module). Dropped unused `os` import that was in the initial draft. Test count: workspace(6) + environment(15) + bash(11) + file_editor(25) = 57. |
+| 2026-02-11 | 6 | Stage 4 complete (73 tests passing) | Implemented SWE-Bench task lifecycle: `SWEBenchInstance` model, task-based `reset(instance=...)`, `get_patch()`, `evaluate()`. Tests use a local git repo fixture (buggy `calc.py` doing subtraction instead of addition) with a test patch that adds `test_calc.py`. Implementation is straightforward: `_setup_instance()` clones repo, checks out base_commit, applies test_patch; `get_patch()` does `git add -A && git diff --cached {base_commit}`; `evaluate()` runs test command and returns `resolved = (exit_code == 0)`. Instance state (`_instance`, `_base_commit`, `_repo_path`) stored on `self` and cleared on every reset. Repo cloned into `workspace/repo` subdirectory. Local paths (starting with `/`) pass through directly as repo URLs, enabling fully offline tests. Test count: workspace(6) + environment(15) + bash(11) + file_editor(25) + task_lifecycle(16) = 73. |
