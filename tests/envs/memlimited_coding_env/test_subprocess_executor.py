@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for SubprocessPyExecutor — memory isolation and timeout enforcement."""
+"""Tests for SubprocessPyExecutor — memory isolation, timeout, and security."""
 
 from __future__ import annotations
 
@@ -63,6 +63,105 @@ class TestBasicExecution:
         assert "10" in result.stdout
 
 
+class TestAllowedImports:
+    def test_math(self, executor: SubprocessPyExecutor):
+        result = executor.run("import math\nprint(math.pi)")
+        assert result.exit_code == 0
+        assert "3.14" in result.stdout
+
+    def test_json(self, executor: SubprocessPyExecutor):
+        result = executor.run("import json\nprint(json.dumps({'a': 1}))")
+        assert result.exit_code == 0
+        assert '"a"' in result.stdout
+
+    def test_re(self, executor: SubprocessPyExecutor):
+        result = executor.run("import re\nprint(re.findall(r'\\d+', 'a1b2c3'))")
+        assert result.exit_code == 0
+        assert "1" in result.stdout
+
+    def test_collections(self, executor: SubprocessPyExecutor):
+        result = executor.run(
+            "from collections import Counter\nprint(Counter('aab'))"
+        )
+        assert result.exit_code == 0
+        assert "a" in result.stdout
+
+    def test_additional_imports(self):
+        """additional_imports extends the allow-list."""
+        os.environ["OPENENV_MEMORY_LIMIT_MB"] = "512"
+        os.environ["OPENENV_TIMEOUT_S"] = "10"
+        try:
+            executor = SubprocessPyExecutor(additional_imports=["ctypes"])
+            result = executor.run("import ctypes\nprint('ok')")
+            assert result.exit_code == 0
+            assert "ok" in result.stdout
+        finally:
+            os.environ.pop("OPENENV_MEMORY_LIMIT_MB", None)
+            os.environ.pop("OPENENV_TIMEOUT_S", None)
+
+
+class TestImportGuard:
+    def test_os_blocked(self, executor: SubprocessPyExecutor):
+        result = executor.run("import os")
+        assert result.exit_code != 0
+        assert "not allowed" in result.stderr.lower()
+
+    def test_subprocess_blocked(self, executor: SubprocessPyExecutor):
+        result = executor.run("import subprocess")
+        assert result.exit_code != 0
+        assert "not allowed" in result.stderr.lower()
+
+    def test_socket_blocked(self, executor: SubprocessPyExecutor):
+        result = executor.run("import socket")
+        assert result.exit_code != 0
+        assert "not allowed" in result.stderr.lower()
+
+    def test_shutil_blocked(self, executor: SubprocessPyExecutor):
+        result = executor.run("import shutil")
+        assert result.exit_code != 0
+        assert "not allowed" in result.stderr.lower()
+
+    def test_ctypes_blocked(self, executor: SubprocessPyExecutor):
+        result = executor.run("import ctypes")
+        assert result.exit_code != 0
+        assert "not allowed" in result.stderr.lower()
+
+    def test_sys_blocked(self, executor: SubprocessPyExecutor):
+        result = executor.run("import sys")
+        assert result.exit_code != 0
+        assert "not allowed" in result.stderr.lower()
+
+
+class TestBuiltinRestrictions:
+    def test_open_removed(self, executor: SubprocessPyExecutor):
+        result = executor.run("open('/etc/passwd')")
+        assert result.exit_code != 0
+
+    def test_eval_removed(self, executor: SubprocessPyExecutor):
+        result = executor.run("eval('1+1')")
+        assert result.exit_code != 0
+
+    def test_exec_removed(self, executor: SubprocessPyExecutor):
+        result = executor.run("exec('x=1')")
+        assert result.exit_code != 0
+
+    def test_compile_removed(self, executor: SubprocessPyExecutor):
+        result = executor.run("compile('x=1', '<test>', 'exec')")
+        assert result.exit_code != 0
+
+    def test_safe_builtins_still_work(self, executor: SubprocessPyExecutor):
+        code = (
+            "x = len([1, 2, 3])\n"
+            "y = isinstance(x, int)\n"
+            "z = sorted([3, 1, 2])\n"
+            "print(x, y, z)"
+        )
+        result = executor.run(code)
+        assert result.exit_code == 0
+        assert "3" in result.stdout
+        assert "True" in result.stdout
+
+
 class TestIsolation:
     def test_no_state_leaks_between_runs(self, executor: SubprocessPyExecutor):
         """Each run() spawns a fresh process -- variables must not persist."""
@@ -72,7 +171,7 @@ class TestIsolation:
 
     def test_crash_does_not_kill_parent(self, executor: SubprocessPyExecutor):
         """A child crash should return an error, not crash the test process."""
-        result = executor.run("import ctypes; ctypes.string_at(0)")
+        result = executor.run("raise SystemExit(1)")
         assert result.exit_code != 0
         # Parent is still alive -- run another execution.
         result2 = executor.run("print('still alive')")

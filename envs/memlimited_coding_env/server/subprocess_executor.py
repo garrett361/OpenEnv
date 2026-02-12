@@ -4,17 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Subprocess-isolated Python executor with memory limits.
+"""Subprocess-isolated Python executor with memory limits and import guards.
 
-Wraps PyExecutor to run each code execution in a separate child process with
-resource limits (RLIMIT_AS for virtual memory, RLIMIT_CPU for CPU time).
-The child process is killed on timeout or OOM, preventing unbounded memory
-usage from affecting the server.
+Runs each code execution in a separate child process with resource limits
+(RLIMIT_AS for virtual memory, RLIMIT_CPU for CPU time).  The child process
+is killed on timeout or OOM, preventing unbounded memory usage from affecting
+the server.
 
-This is the OpenEnv equivalent of SandboxFusion's ``memory_limit_MB`` --
-SandboxFusion ran code in an isolated container with explicit memory caps;
-this module achieves similar isolation via ``multiprocessing.Process`` with
-``resource.setrlimit``.
+Security layers (inside the child process):
+    1. RLIMIT_AS / RLIMIT_CPU — OS-level resource caps.
+    2. Restricted ``__import__`` — only allow-listed modules can be imported.
+    3. Stripped builtins — ``open``, ``eval``, ``exec``, ``compile`` removed.
+    4. ``sys.addaudithook`` — backstop blocking subprocess, os.system, sockets.
 
 Configure via environment variables:
     OPENENV_MEMORY_LIMIT_MB  Max *additional* virtual memory the child may
@@ -26,11 +27,16 @@ Configure via environment variables:
 
 from __future__ import annotations
 
+import builtins as _builtins_mod
+import contextlib
+import io
 import logging
 import multiprocessing as mp
 import os
 import resource
 import signal
+import sys
+import traceback
 
 from openenv.core.env_server.types import CodeExecResult
 
@@ -41,6 +47,83 @@ _DEFAULT_MEMORY_LIMIT_MB = 4096
 _DEFAULT_TIMEOUT_S = 30
 _DEFAULT_CPU_LIMIT_S = 60
 
+# ---------------------------------------------------------------------------
+# Import allow-list
+# ---------------------------------------------------------------------------
+_DEFAULT_ALLOWED_MODULES: frozenset[str] = frozenset({
+    # stdlib — safe, no OS/network side effects
+    "math", "cmath", "statistics", "random",
+    "collections", "itertools", "functools", "operator",
+    "string", "re", "json", "csv",
+    "datetime", "time", "calendar",
+    "decimal", "fractions",
+    "copy", "pprint", "textwrap", "unicodedata",
+    "hashlib", "hmac", "base64", "binascii",
+    "struct", "array", "bisect", "heapq",
+    "enum", "dataclasses", "typing", "numbers",
+    "abc", "contextlib",
+    # third-party — data science
+    "numpy", "pandas", "scipy", "sympy", "sklearn",
+})
+
+_BLOCKED_AUDIT_EVENTS: frozenset[str] = frozenset({
+    "subprocess.Popen",
+    "os.system",
+    "os.exec",
+    "os.spawn",
+    "socket.connect",
+    "socket.bind",
+    "socket.sendto",
+    "webbrowser.open",
+})
+
+
+def _make_restricted_import(
+    allowed: frozenset[str],
+) -> callable:
+    """Return an ``__import__`` replacement that only allows *allowed* modules."""
+    original = _builtins_mod.__import__
+
+    def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0:
+            # Relative imports within an already-allowed package — permit.
+            return original(name, globals, locals, fromlist, level)
+        top_level = name.split(".")[0]
+        if top_level not in allowed:
+            raise ImportError(
+                f"Import of '{name}' is not allowed in this sandbox. "
+                f"Permitted top-level modules: {sorted(allowed)}"
+            )
+        return original(name, globals, locals, fromlist, level)
+
+    return _restricted_import
+
+
+def _make_safe_builtins(allowed_modules: frozenset[str]) -> dict:
+    """Build a builtins dict with dangerous functions removed."""
+    dangerous = {"exec", "eval", "compile", "open", "__import__", "breakpoint"}
+    safe = {k: v for k, v in vars(_builtins_mod).items() if k not in dangerous}
+    safe["__import__"] = _make_restricted_import(allowed_modules)
+    return safe
+
+
+def _install_audit_hook() -> None:
+    """Install a one-way audit hook blocking dangerous syscall patterns."""
+
+    def _hook(event: str, args):
+        if event in _BLOCKED_AUDIT_EVENTS:
+            raise RuntimeError(
+                f"Blocked operation: {event}. "
+                "OS commands, subprocesses, and network access are not "
+                "permitted in this sandbox."
+            )
+
+    sys.addaudithook(_hook)
+
+
+# ---------------------------------------------------------------------------
+# Child process
+# ---------------------------------------------------------------------------
 
 def _get_vm_size_bytes() -> int:
     """Read current virtual memory size from /proc/self/status (Linux)."""
@@ -56,21 +139,18 @@ def _get_vm_size_bytes() -> int:
 
 def _child_worker(
     code: str,
-    additional_imports: list[str],
     memory_limit_bytes: int,
     cpu_limit_s: int,
+    allowed_modules: frozenset[str],
     conn: mp.connection.Connection,
 ) -> None:
-    """Execute *code* inside a resource-limited child process.
+    """Execute *code* via ``exec()`` inside a resource-limited child process.
 
     Results are sent back through *conn* as a ``(stdout, stderr, exit_code)``
     tuple.  On ``MemoryError`` or other failures the error is reported via
     the same tuple so the parent never blocks on the pipe.
     """
-    # --- Set resource limits before running any user code -----------------
-    # RLIMIT_AS is relative to the total virtual address space.  After a
-    # fork the child inherits the parent's mappings, so we read the current
-    # VmSize and add the configured headroom.
+    # --- Resource limits ---------------------------------------------------
     try:
         current_vm = _get_vm_size_bytes()
         new_limit = current_vm + memory_limit_bytes
@@ -85,27 +165,46 @@ def _child_worker(
         logger.debug("Could not set RLIMIT_CPU", exc_info=True)
         raise
 
-    # --- Execute ----------------------------------------------------------
-    # Import here so the limits are in place before we do any real work.
-    from coding_env.server.python_executor import PyExecutor  # noqa: E402
+    # --- Security: audit hook + restricted builtins ------------------------
+    _install_audit_hook()
+    safe_builtins = _make_safe_builtins(allowed_modules)
+
+    # --- Execute via exec() -----------------------------------------------
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    exit_code = 0
 
     try:
-        executor = PyExecutor(additional_imports=additional_imports)
-        result = executor.run(code)
-        conn.send((result.stdout, result.stderr, result.exit_code))
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(
+            stderr_buf
+        ):
+            exec(
+                compile(code, "<agent>", "exec"),
+                {"__builtins__": safe_builtins},
+            )
     except MemoryError:
         try:
             conn.send(("", "MemoryError: execution exceeded memory limit", 137))
         except Exception:
-            logger.debug("Child could not send MemoryError through pipe", exc_info=True)
-    except Exception as e:
-        try:
-            conn.send(("", f"Subprocess error: {e}", 1))
-        except Exception:
-            logger.debug("Child could not send error through pipe", exc_info=True)
+            logger.debug(
+                "Child could not send MemoryError through pipe", exc_info=True
+            )
+        return
+    except Exception:
+        stderr_buf.write(traceback.format_exc())
+        exit_code = 1
+
+    try:
+        conn.send((stdout_buf.getvalue(), stderr_buf.getvalue(), exit_code))
+    except Exception:
+        logger.debug("Child could not send result through pipe", exc_info=True)
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 class SubprocessPyExecutor:
     """Execute Python code in an isolated subprocess with memory/time limits.
@@ -115,15 +214,18 @@ class SubprocessPyExecutor:
     1. Sets ``RLIMIT_AS`` to ``current_vm + memory_limit`` to cap virtual
        memory.
     2. Sets ``RLIMIT_CPU`` as a CPU-time backstop.
-    3. Creates a fresh :class:`PyExecutor` and runs the code.
-    4. Is ``terminate``/``kill``-ed on timeout.
+    3. Installs an audit hook and restricted builtins (import allow-list).
+    4. Runs the code with ``exec()`` (real CPython, no AST interpreter).
+    5. Is ``terminate``/``kill``-ed on timeout.
 
     The interface (``run(code) -> CodeExecResult``) is identical to
-    :class:`PyExecutor`, so this is a drop-in replacement.
+    ``coding_env``'s ``PyExecutor``, so this is a drop-in replacement.
     """
 
     def __init__(self, additional_imports: list[str] | None = None):
-        self.additional_imports = additional_imports or []
+        self._allowed_modules = _DEFAULT_ALLOWED_MODULES | frozenset(
+            additional_imports or []
+        )
         self.memory_limit_mb = int(
             os.environ.get("OPENENV_MEMORY_LIMIT_MB", _DEFAULT_MEMORY_LIMIT_MB)
         )
@@ -134,10 +236,12 @@ class SubprocessPyExecutor:
             os.environ.get("OPENENV_CPU_LIMIT_S", _DEFAULT_CPU_LIMIT_S)
         )
         logger.info(
-            "SubprocessPyExecutor: memory_limit=%dMB timeout=%ds cpu_limit=%ds",
+            "SubprocessPyExecutor: memory_limit=%dMB timeout=%ds cpu_limit=%ds "
+            "allowed_modules=%d",
             self.memory_limit_mb,
             self.timeout_s,
             self.cpu_limit_s,
+            len(self._allowed_modules),
         )
 
     def run(self, code: str) -> CodeExecResult:
@@ -148,15 +252,14 @@ class SubprocessPyExecutor:
             target=_child_worker,
             args=(
                 code,
-                self.additional_imports,
                 self.memory_limit_mb * 1024 * 1024,
                 self.cpu_limit_s,
+                self._allowed_modules,
                 child_conn,
             ),
             daemon=True,
         )
         proc.start()
-        # Close the write-end in the parent so we get EOF when child closes.
         child_conn.close()
 
         try:
@@ -167,7 +270,6 @@ class SubprocessPyExecutor:
                     stdout=stdout, stderr=stderr, exit_code=exit_code
                 )
 
-            # Timeout -- kill the child.
             self._kill_process(proc)
             return CodeExecResult(
                 stdout="",
@@ -176,8 +278,6 @@ class SubprocessPyExecutor:
             )
 
         except (EOFError, OSError):
-            # Pipe broken before we got a result -- child crashed (OOM /
-            # signal).
             self._kill_process(proc)
             exit_code = proc.exitcode
             if exit_code is not None and exit_code < 0:
@@ -211,10 +311,14 @@ class SubprocessPyExecutor:
             proc.terminate()
             proc.join(timeout=5)
         except Exception:
-            logger.warning("Failed to terminate child pid=%s", proc.pid, exc_info=True)
+            logger.warning(
+                "Failed to terminate child pid=%s", proc.pid, exc_info=True
+            )
         if proc.is_alive():
             try:
                 proc.kill()
                 proc.join(timeout=5)
             except Exception:
-                logger.warning("Failed to kill child pid=%s", proc.pid, exc_info=True)
+                logger.warning(
+                    "Failed to kill child pid=%s", proc.pid, exc_info=True
+                )
