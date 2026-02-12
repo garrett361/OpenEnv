@@ -1,8 +1,8 @@
 ---
-title: Swe Env Environment Server
-emoji: 📀
-colorFrom: pink
-colorTo: pink
+title: SWE Environment Server
+emoji: 🔧
+colorFrom: blue
+colorTo: green
 sdk: docker
 pinned: false
 app_port: 8000
@@ -11,245 +11,179 @@ tags:
   - openenv
 ---
 
-# Swe Env Environment
+# SWE Environment
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+A sandboxed workspace environment for software engineering agents. Exposes `bash` and `file_editor` tools via MCP, designed to run SWE-Bench tasks end-to-end. Drop-in replacement for OpenHands as the environment backend in SWE-Bench agent training pipelines like SkyRL-Agent.
 
 ## Quick Start
 
-The simplest way to use the Swe Env environment is through the `SweEnv` class:
+```python
+from swe_env import SWEEnv, CallToolAction
+
+# Connect to a running server
+with SWEEnv(base_url="http://localhost:8000") as env:
+    env.reset()
+
+    # Discover available tools
+    tools = env.list_tools()
+    print([t.name for t in tools])  # ['bash', 'file_editor']
+
+    # Run a shell command
+    result = env.call_tool("bash", command="ls -la")
+    print(result)
+
+    # Edit a file
+    result = env.call_tool(
+        "file_editor",
+        command="create",
+        path="hello.py",
+        file_text="print('hello')\n",
+    )
+```
+
+## SWE-Bench Workflow
+
+The environment supports the full SWE-Bench task lifecycle: reset with an instance, explore and fix the bug, extract the patch, evaluate.
 
 ```python
-from swe_env import SweAction, SweEnv
+from swe_env import SWEEnv, SWEBenchInstance, CallToolAction
 
-try:
-    # Create environment from Docker image
-    swe_envenv = SweEnv.from_docker_image("swe_env-env:latest")
+with SWEEnv(base_url="http://localhost:8000") as env:
+    # 1. Reset with a SWE-Bench instance
+    instance = {
+        "instance_id": "django__django-11099",
+        "repo": "django/django",
+        "base_commit": "abc123...",
+        "problem_statement": "Bug report text...",
+        "test_patch": "diff --git a/...",
+    }
+    obs = env.reset(instance=instance)
+    # obs.metadata contains instance_id, problem_statement, workspace_path
 
-    # Reset
-    result = swe_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
+    # 2. Agent explores and fixes the bug
+    env.call_tool("bash", command="find . -name '*.py' | head -20")
+    env.call_tool("bash", command="python -m pytest tests/ -x")
+    env.call_tool(
+        "file_editor",
+        command="str_replace",
+        path="repo/src/module.py",
+        old_str="broken_code()",
+        new_str="fixed_code()",
+    )
 
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
+    # 3. Extract the patch
+    patch = env.call_tool("get_patch")  # git diff from base_commit
 
-    for msg in messages:
-        result = swe_envenv.step(SweAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
-
-finally:
-    # Always clean up
-    swe_envenv.close()
+    # 4. Evaluate
+    result = env.call_tool("evaluate", test_command="python -m pytest tests/")
+    print(result["resolved"])  # True/False
 ```
 
-That's it! The `SweEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
+## Tools
 
-## Building the Docker Image
+### `bash`
 
-Before using the environment, you need to build the Docker image:
+Runs shell commands via `subprocess.run` in the workspace directory.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `command` | str | required | Shell command to execute |
+| `timeout` | int | 120 | Timeout in seconds (0 = use default) |
+
+Returns `{"stdout": str, "stderr": str, "exit_code": int}`. Exit code 124 on timeout.
+
+### `file_editor`
+
+Structured file editing with five operations, selected by the `command` parameter.
+
+| Command | Description | Required Parameters |
+|---------|-------------|---------------------|
+| `view` | Display file contents with line numbers, or list directory | `path` |
+| `create` | Create a new file (fails if exists) | `path`, `file_text` |
+| `str_replace` | Find and replace an exact string (must match once) | `path`, `old_str`, `new_str` |
+| `insert` | Insert text after a line number (0 = before first line) | `path`, `insert_line`, `new_str` |
+| `undo_edit` | Revert the last edit to a file | `path` |
+
+Returns `{"output": str, "exit_code": int}`.
+
+Optional parameters: `view_range` (string `"start,end"`, 1-indexed) for `view`.
+
+## Architecture
+
+```
+WebSocket connect
+  → factory creates SWEEnvironment (independent workspace per session)
+    → reset(instance=...) → clone repo, checkout commit, apply test_patch
+    → step() × N → agent uses bash + file_editor
+    → get_patch() → git diff from base_commit
+    → evaluate() → run tests, return resolved/not-resolved
+    → reset(instance=...) → next episode
+  → disconnect → cleanup workspace
+```
+
+Each WebSocket session gets its own:
+- **Workspace**: isolated temp directory via `tempfile.TemporaryDirectory`
+- **FastMCP server**: independent tool dispatch
+- **File editor state**: separate undo history
+
+## SWE-Bench Instance Format
+
+The `reset(instance=...)` method accepts a dict or `SWEBenchInstance` with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `instance_id` | str | Unique identifier (e.g. `django__django-11099`) |
+| `repo` | str | Repository (`owner/name` or full URL or local path) |
+| `base_commit` | str | Git commit hash to checkout |
+| `problem_statement` | str | Bug report text (the agent's instructions) |
+| `test_patch` | str | Patch with failing tests (optional) |
+| `version` | str | Version identifier (optional) |
+
+## Building and Running
+
+### Docker
 
 ```bash
-# From project root
-docker build -t swe_env-env:latest -f server/Dockerfile .
+# Build
+docker build -t swe-env:latest -f server/Dockerfile .
+
+# Run
+docker run -p 8000:8000 swe-env:latest
+
+# Or from Docker image
+from swe_env import SWEEnv
+env = SWEEnv.from_docker_image("swe-env:latest")
 ```
 
-## Deploying to Hugging Face Spaces
-
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
+### Local Development
 
 ```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
+# Run the server
+uvicorn server.app:app --host 0.0.0.0 --port 8000
 
-# Or specify options
-openenv push --namespace my-org --private
-```
-
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
-
-### Prerequisites
-
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
-
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
-
-```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
-```
-
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**SweAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**SweObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a Swe Env environment server running, you can connect directly:
-
-```python
-from swe_env import SweEnv
-
-# Connect to existing server
-swe_envenv = SweEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = swe_envenv.reset()
-result = swe_envenv.step(SweAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `swe_envenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from swe_env import SweAction, SweEnv
-
-# Connect with context manager (auto-connects and closes)
-with SweEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(SweAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    SweEnvironment,  # Pass class, not instance
-    SweAction,
-    SweObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then multiple clients can connect simultaneously:
-
-```python
-from swe_env import SweAction, SweEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with SweEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(SweAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
-
-```bash
-# From the server directory
-python3 server/swe_env_environment.py
-```
-
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
-
-### Running Locally
-
-Run the server locally for development:
-
-```bash
-uvicorn server.app:app --reload
+# Run tests
+PYTHONPATH=src:envs uv run python -m pytest tests/envs/swe_env/ -v
 ```
 
 ## Project Structure
 
 ```
 swe_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # SweEnv client
-├── models.py              # Action and Observation models
+├── __init__.py              # Exports: SWEEnv, SWEBenchInstance, SWEState
+├── models.py                # SWEState, SWEBenchInstance
+├── client.py                # SWEEnv(MCPToolClient)
+├── openenv.yaml             # OpenEnv manifest
+├── pyproject.toml            # Dependencies
 └── server/
-    ├── __init__.py        # Server module exports
-    ├── swe_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+    ├── __init__.py           # Exports: SWEEnvironment
+    ├── app.py                # FastAPI app via create_app()
+    ├── environment.py        # SWEEnvironment(MCPEnvironment)
+    ├── workspace.py          # Workspace (temp directory wrapper)
+    ├── tool_module.py        # ToolModule Protocol
+    ├── tools/
+    │   ├── __init__.py
+    │   ├── bash_tool.py      # BashToolModule
+    │   └── file_editor_tool.py  # FileEditorToolModule
+    ├── Dockerfile
+    └── requirements.txt
 ```
