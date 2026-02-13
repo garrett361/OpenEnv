@@ -41,6 +41,8 @@ class MemlimitedPythonCodeActEnv(PythonCodeActEnv):
     and imports do not carry over between steps.
     """
 
+    SUPPORTS_CONCURRENT_SESSIONS = True
+
     def __init__(self, additional_imports: list[str] | None = None):
         super().__init__()
         self._additional_imports = additional_imports or []

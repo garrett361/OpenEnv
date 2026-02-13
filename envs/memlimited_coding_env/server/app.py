@@ -15,6 +15,8 @@ Usage:
     uvicorn memlimited_coding_env.server.app:app --host 0.0.0.0 --port 8000
 """
 
+import os
+
 from openenv.core.env_server import create_app
 
 from coding_env.models import CodeAction, CodeObservation
@@ -27,6 +29,7 @@ app = create_app(
     CodeAction,
     CodeObservation,
     env_name="memlimited_coding_env",
+    max_concurrent_envs=int(os.environ.get("OPENENV_MAX_CONCURRENT_ENVS", 256)),
 )
 
 
