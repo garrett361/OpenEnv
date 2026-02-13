@@ -43,6 +43,8 @@ class PythonCodeActEnv(Environment):
         >>> print(env.state.last_exit_code)  # 0
     """
 
+    SUPPORTS_CONCURRENT_SESSIONS = True
+
     def __init__(
         self,
     ):
