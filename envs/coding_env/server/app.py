@@ -21,6 +21,8 @@ Usage:
     python -m envs.coding_env.server.app
 """
 
+import os
+
 from openenv.core.env_server import create_app
 
 from coding_env.models import CodeAction, CodeObservation
@@ -28,7 +30,13 @@ from coding_env.server.python_codeact_env import PythonCodeActEnv
 
 # Create the app with web interface and README integration
 # Pass the class (factory) instead of an instance for WebSocket session support
-app = create_app(PythonCodeActEnv, CodeAction, CodeObservation, env_name="coding_env")
+app = create_app(
+    PythonCodeActEnv,
+    CodeAction,
+    CodeObservation,
+    env_name="coding_env",
+    max_concurrent_envs=int(os.environ.get("OPENENV_MAX_CONCURRENT_ENVS", 256)),
+)
 
 
 if __name__ == "__main__":

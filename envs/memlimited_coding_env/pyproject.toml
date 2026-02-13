@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-memlimited_coding_env"
+version = "0.1.0"
+description = "Memory-limited Coding Environment for OpenEnv (subprocess isolation)"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-coding_env>=0.1.0",
+]
+
+[project.scripts]
+memlimited-coding-env-server = "memlimited_coding_env.server.app:main"
+
+[tool.setuptools]
+packages = ["memlimited_coding_env", "memlimited_coding_env.server"]
+package-dir = { "memlimited_coding_env" = ".", "memlimited_coding_env.server" = "server" }
+
+[tool.setuptools.package-data]
+memlimited_coding_env = ["**/*.yaml", "**/*.yml"]
